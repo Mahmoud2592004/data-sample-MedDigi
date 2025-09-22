@@ -203,12 +203,12 @@ st.markdown("""
 @st.cache_resource(show_spinner=False)
 def get_firestore_client():
     if not firebase_admin._apps:
-        # Load Firebase secrets
-        firebase_config = st.secrets["firebase"]
+        # Load Firebase secrets and create a mutable copy
+        firebase_config = dict(st.secrets["firebase"])
         # Convert private key string into valid format
         firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
         # Initialize Firebase app
-        cred = credentials.Certificate(dict(firebase_config))
+        cred = credentials.Certificate(firebase_config)
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
