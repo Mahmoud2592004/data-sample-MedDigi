@@ -905,13 +905,6 @@ else:
                 st.info("No data available for statistics.")
         st.subheader("📋 Prescription Records")
         if not df.empty:
-            left, mid, right = st.columns([2, 5, 2])
-            with left:
-                csv_bytes = df.to_csv(index=False).encode('utf-8')
-                st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="prescriptions.csv", mime="text/csv")
-            with right:
-                with st.expander("Table View", expanded=False):
-                    st.dataframe(df, use_container_width=True, height=360)
             if st.session_state.list_mode:
                 total = len(df)
                 per_page = int(st.session_state.get('records_per_page', 10) or 10)
