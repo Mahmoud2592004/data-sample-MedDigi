@@ -14,6 +14,8 @@ import unicodedata
 from PIL import Image, ImageDraw, ImageFont
 import io
 import base64
+from collections import Counter
+import os
 
 # Constants
 FREE_LIMIT = 10  # Free sample records
@@ -203,12 +205,17 @@ st.markdown("""
 @st.cache_resource(show_spinner=False)
 def get_firestore_client():
     if not firebase_admin._apps:
-        # Load Firebase secrets and create a mutable copy
-        firebase_config = dict(st.secrets["firebase"])
-        # Convert private key string into valid format
-        firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
+        # Check if running locally by looking for a JSON credentials file
+        json_path = "login-f29f0-firebase-adminsdk-eoqgr-23461e0aac.json"
+        if os.path.exists(json_path):
+            # Load credentials from JSON file for local environment
+            cred = credentials.Certificate(json_path)
+        else:
+            # Use Streamlit secrets for deployed environment
+            firebase_config = dict(st.secrets["firebase"])
+            firebase_config["private_key"] = firebase_config["private_key"].replace("\\n", "\n")
+            cred = credentials.Certificate(firebase_config)
         # Initialize Firebase app
-        cred = credentials.Certificate(firebase_config)
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
@@ -219,6 +226,15 @@ def get_b2_authorization() -> Dict[str, str]:
     resp.raise_for_status()
     data = resp.json()
     return {"authorizationToken": data["authorizationToken"], "downloadUrl": data["downloadUrl"]}
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_governorate(lat: float, lon: float) -> str:
+    addr = reverse_geocode(lat, lon)
+    if addr:
+        a = addr.get('address', {})
+        gov = a.get('state') or a.get('province') or a.get('county') or 'Unknown'
+        return gov
+    return 'Unknown'
 
 def fetch_b2_file_bytes(file_url: str) -> Optional[bytes]:
     if not file_url:
@@ -561,7 +577,6 @@ def fetch_prescriptions(start_date: Optional[date], end_date: Optional[date]) ->
             'Date': timestamp.date().isoformat() if isinstance(timestamp, datetime) else None,
             'Location': textual_location or '',
             'Image URL': data.get('imageUrl') or '',
-            'API Used': data.get('apiUsed') or '',
             'User Full Name': data.get('username') or '',
             'Pharmacy Name': data.get('pharmacy_name') or '',
             'Latitude': latitude,
@@ -572,7 +587,6 @@ def fetch_prescriptions(start_date: Optional[date], end_date: Optional[date]) ->
         }
         records.append(record)
     return records
-
 # Session State
 if 'user' not in st.session_state:
     st.session_state.user = None
@@ -709,12 +723,186 @@ else:
                     df['Pharmacy Name'].fillna('').str.contains(user_filter_term, case=False, na=False)
                 )
                 df = df[user_mask]
+                # Fetch unfiltered data for statistics
+        # stats_records = fetch_prescriptions(None, None)
+        # stats_df = pd.DataFrame(stats_records)
         st.subheader("📊 Overview")
         col1, col2, col3 = st.columns([1, 1, 1])
         col1.metric("Total Prescriptions", len(df))
         col2.metric("Locations", len(df['Location'].dropna().unique()) if not df.empty else 0)
         col3.metric("Users", len(df['User Full Name'].dropna().unique()) if not df.empty else 0)
         st.divider()
+        # Drug Statistics Section
+        st.subheader("📊 Drug Statistics")
+        # Drug Statistics Section
+        with st.expander("📊 Drug Statistics", expanded=not st.session_state.compact_view):
+            # Use df for statistics to apply filters
+            if not df.empty:
+                # Add Governorate column
+                df['Governorate'] = df.apply(
+                    lambda row: get_governorate(row['Latitude'], row['Longitude']) 
+                    if pd.notnull(row['Latitude']) and pd.notnull(row['Longitude']) 
+                    else 'Unknown', axis=1
+                )
+                
+                # Most common drugs overall
+                st.write("**Most Common Drugs Overall:**")
+                all_drugs = [drug.lower() for drugs in df['Confirmed Drugs'] for drug in (drugs if drugs else [])]
+                drug_counts = Counter(all_drugs)
+                if drug_counts:
+                    top_drugs = drug_counts.most_common(10)
+                    top_drugs_df = pd.DataFrame(top_drugs, columns=['Drug', 'Count'])
+                    fig = px.bar(
+                        top_drugs_df,
+                        x='Drug',
+                        y='Count',
+                        title="Top 10 Most Common Drugs",
+                        color_discrete_sequence=['#3498db'],
+                        labels={'Drug': 'Drug Name', 'Count': 'Number of Prescriptions'},
+                    )
+                    fig.update_layout(
+                        plot_bgcolor='#ffffff',
+                        paper_bgcolor='#ffffff',
+                        font=dict(color='#000000'),
+                        xaxis=dict(gridcolor='#d1d5db', zerolinecolor='#d1d5db', tickangle=45, tickfont=dict(color='#000000'), title_font=dict(color='#000000')),
+                        yaxis=dict(gridcolor='#d1d5db', zerolinecolor='#d1d5db', tickfont=dict(color='#000000'), title_font=dict(color='#000000'), tickvals=list(range(0, int(top_drugs_df['Count'].max()) + 1, 1))),
+                        title_font=dict(color='#000000'),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.write("No drugs found.")
+                
+                # Most common drugs in each governorate
+                st.write("**Most Common Drugs by Governorate:**")
+                exploded_df = df.explode('Confirmed Drugs')
+                exploded_df['Confirmed Drugs'] = exploded_df['Confirmed Drugs'].str.lower()
+                gov_drug_counts = exploded_df.groupby('Governorate')['Confirmed Drugs'].value_counts().reset_index(name='Count')
+                top_per_gov = gov_drug_counts[gov_drug_counts['Governorate'] != 'Unknown'].groupby('Governorate').head(5)
+                
+                if not top_per_gov.empty:
+                    all_governorates = sorted(top_per_gov['Governorate'].unique())
+                    # Initialize session state for governorate selections if not already set
+                    if 'selected_governorates' not in st.session_state:
+                        st.session_state.selected_governorates = all_governorates
+                    
+                    # Checkbox panel for governorates
+                    st.write("**Select Governorates:**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("Select All"):
+                            st.session_state.selected_governorates = all_governorates
+                            st.rerun()
+                    with col2:
+                        if st.button("Deselect All"):
+                            st.session_state.selected_governorates = []
+                            st.rerun()
+                    
+                    # Display governorates in three columns
+                    selected_governorates = []
+                    num_cols = 3
+                    cols = st.columns(num_cols)
+                    for i, gov in enumerate(all_governorates):
+                        col_idx = i % num_cols
+                        with cols[col_idx]:
+                            is_selected = st.checkbox(
+                                gov,
+                                value=gov in st.session_state.selected_governorates,
+                                key=f"gov_{gov}"
+                            )
+                            if is_selected:
+                                selected_governorates.append(gov)
+                    # Update session state
+                    st.session_state.selected_governorates = selected_governorates
+                    
+                    if selected_governorates:
+                        for gov in selected_governorates:
+                            st.write(f"#### {gov}")
+                            gov_data = top_per_gov[top_per_gov['Governorate'] == gov][['Confirmed Drugs', 'Count']]
+                            fig = px.bar(
+                                gov_data,
+                                x='Confirmed Drugs',
+                                y='Count',
+                                title=f"Top 5 Drugs in {gov}",
+                                color_discrete_sequence=['#2ecc71'],
+                                labels={'Confirmed Drugs': 'Drug Name', 'Count': 'Number of Prescriptions'},
+                            )
+                            fig.update_layout(
+                                plot_bgcolor='#ffffff',
+                                paper_bgcolor='#ffffff',
+                                font=dict(color='#000000'),
+                                xaxis=dict(gridcolor='#d1d5db', zerolinecolor='#d1d5db', tickangle=45, tickfont=dict(color='#000000'), title_font=dict(color='#000000')),
+                                yaxis=dict(gridcolor='#d1d5db', zerolinecolor='#d1d5db', tickfont=dict(color='#000000'), title_font=dict(color='#000000'), tickvals=list(range(0, int(gov_data['Count'].max()) + 1, 1))),
+                                title_font=dict(color='#000000'),
+                                showlegend=False,
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Please select a governorate.")
+                else:
+                    st.write("No governorate data available.")
+                
+                # Most common drugs relative to date (top drug per date)
+                st.write("**Most Common Drugs by Date:**")
+                date_drug_counts = exploded_df.groupby('Date')['Confirmed Drugs'].value_counts().reset_index(name='Count')
+                top_per_date = date_drug_counts.loc[date_drug_counts.groupby('Date')['Count'].idxmax()]
+                if not top_per_date.empty:
+                    top_per_date = top_per_date.sort_values('Date')
+                    if len(top_per_date) > 5:
+                        # Show first 5 by default
+                        if 'show_more_dates' not in st.session_state:
+                            st.session_state.show_more_dates = False
+                        
+                        display_df = top_per_date.head(5) if not st.session_state.show_more_dates else top_per_date
+                        st.table(display_df[['Date', 'Confirmed Drugs', 'Count']])
+                        
+                        if st.button("Show More" if not st.session_state.show_more_dates else "Show Less"):
+                            st.session_state.show_more_dates = not st.session_state.show_more_dates
+                            st.rerun()
+                    else:
+                        st.table(top_per_date[['Date', 'Confirmed Drugs', 'Count']])
+                else:
+                    st.write("No date-specific drug data.")
+                
+                # Most common drug combinations
+                st.write("**Most Common Drug Combinations:**")
+                from itertools import combinations
+                
+                combo_counter = Counter()
+                for drugs in df['Confirmed Drugs']:
+                    if drugs:
+                        lower_drugs = [d.lower() for d in drugs]
+                        for size in range(2, 5):  # Combinations of 2, 3, or 4 drugs
+                            for combo in combinations(sorted(lower_drugs), size):
+                                combo_counter[', '.join(combo)] += 1
+                
+                if combo_counter:
+                    top_combos = combo_counter.most_common(10)
+                    combo_counts = pd.DataFrame(top_combos, columns=['Drug Combo', 'Count'])
+                    fig = px.bar(
+                        combo_counts,
+                        x='Drug Combo',
+                        y='Count',
+                        title="Top 10 Drug Combinations",
+                        color_discrete_sequence=['#e74c3c'],
+                        labels={'Drug Combo': 'Drug Combination', 'Count': 'Number of Prescriptions'},
+                    )
+                    fig.update_layout(
+                        plot_bgcolor='#ffffff',
+                        paper_bgcolor='#ffffff',
+                        font=dict(color='#000000'),
+                        xaxis=dict(gridcolor='#d1d5db', zerolinecolor='#d1d5db', tickangle=45, tickfont=dict(color='#000000'), title_font=dict(color='#000000')),
+                        yaxis=dict(gridcolor='#d1d5db', zerolinecolor='#d1d5db', tickfont=dict(color='#000000'), title_font=dict(color='#000000'), tickvals=list(range(0, int(combo_counts['Count'].max()) + 1, 1))),
+                        title_font=dict(color='#000000'),
+                        title_x=0.5,   # <-- centers the title
+                        title_y=0.95,
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.write("No drug combinations found.")
+            else:
+                st.info("No data available for statistics.")
         st.subheader("📋 Prescription Records")
         if not df.empty:
             left, mid, right = st.columns([2, 5, 2])
@@ -1127,5 +1315,3 @@ else:
                 title_font=dict(color='#000000'),
             )
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No records found matching your filter criteria.")
