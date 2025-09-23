@@ -529,7 +529,7 @@ def find_nearest_pharmacy(lat: float, lon: float) -> Optional[Dict[str, Any]]:
 @st.cache_data(show_spinner=True, ttl=60)
 def fetch_prescriptions(start_date: Optional[date], end_date: Optional[date]) -> List[Dict[str, Any]]:
     db = get_firestore_client()
-    col = db.collection('data_sample')
+    col = db.collection('updated_data_sample')
     query = col
     apply_range = False
     if start_date is not None:
